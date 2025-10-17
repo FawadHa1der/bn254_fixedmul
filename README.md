@@ -1,0 +1,1 @@
+Trying to optimize Bn254 muls when one operand is fixed as when a challenge comes in from the verifier in Sumcheck and that challenge is bound to the MLE.
