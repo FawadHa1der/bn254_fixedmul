@@ -8,6 +8,7 @@
 use ark_bn254::{Fr, FrConfig};
 use ark_ff::{BigInteger, Field, PrimeField};
 use ark_ff::MontConfig;
+//use super::{encode_batch_to_mont, mul_many_mont_sum, mont_to_fr};
 
 #[inline(always)]
 fn addcarry(a: u64, b: u64, carry: &mut u64) -> u64 {
@@ -169,6 +170,13 @@ pub struct FixedMontgomeryMulA {
 }
 
 impl FixedMontgomeryMulA {
+
+        /// Expose the fixed multiplicand residue for internal consumers (GPU path).
+    #[inline(always)]
+    pub fn a_mont_words(&self) -> [u64; 4] {
+        self.a_mont
+    }
+
     /// Build from a canonical `Fr` (any representation). Internally stores Montgomery residue a*R.
     pub fn new(a: Fr) -> Self {
         Self { a_mont: mont_encode(a) }
@@ -185,6 +193,62 @@ impl FixedMontgomeryMulA {
     pub fn mul_mont(&self, x_mont: [u64;4]) -> [u64;4] {
         mont_mul_raw(x_mont, self.a_mont)
     }
+}
+
+
+
+/// Encode a batch of Fr into Montgomery residues (x*R), once.
+pub fn encode_batch_to_mont(xs: &[Fr]) -> Vec<[u64; 4]> {
+    xs.iter().map(|&x| mont_encode(x)).collect()
+}
+
+/// Decode a Montgomery residue to Fr (x*R -> x).
+pub fn mont_to_fr(z_mont: [u64; 4]) -> Fr {
+    mont_decode(z_mont)
+}
+
+/// Add two 256-bit little-endian residues modulo p (Mont domain add).
+#[inline(always)]
+fn mont_add(a: [u64;4], b: [u64;4]) -> [u64;4] {
+    let p = FrConfig::MODULUS.as_ref();
+    // a + b
+    let (s0, c0) = a[0].overflowing_add(b[0]);
+    let (t1, c1) = a[1].overflowing_add(b[1]); let (s1, c1b) = t1.overflowing_add(c0 as u64);
+    let (t2, c2) = a[2].overflowing_add(b[2]); let (s2, c2b) = t2.overflowing_add((c1|c1b) as u64);
+    let (t3, c3) = a[3].overflowing_add(b[3]); let (s3, c3b) = t3.overflowing_add((c2|c2b) as u64);
+    let carry = (c3 as u8) | (c3b as u8);
+
+    // conditional subtract p
+    // compute s - p
+    let (d0, b0) = s0.overflowing_sub(p[0]);
+    let (d1, b1) = s1.overflowing_sub(p[1] + (b0 as u64));
+    let (d2, b2) = s2.overflowing_sub(p[2] + (b1 as u64));
+    let (d3, b3) = s3.overflowing_sub(p[3] + (b2 as u64));
+    let borrow = b3 as u8;
+
+    // if carry==1 or borrow==0 then take d (>=p wrapped or >=p), else take s
+    // More strictly: if (carry==1) || (s >= p) => choose d
+    let choose_d = (carry == 1) as u64 | ((borrow == 0) as u64);
+    let m = u64::wrapping_sub(0, choose_d); // 0xffff.. if choose_d==1 else 0
+    [
+        (d0 & m) | (s0 & !m),
+        (d1 & m) | (s1 & !m),
+        (d2 & m) | (s2 & !m),
+        (d3 & m) | (s3 & !m),
+    ]
+}
+
+/// Multiply many by fixed-A in raw Montgomery domain:
+/// - inputs: x_mont = x*R
+/// - uses mont_mul_raw(x_mont, a_mont)
+/// - returns a Mont-domain *sum* so you can decode once.
+pub fn mul_many_mont_sum(fixed: &FixedMontgomeryMulA, xs_mont: &[[u64;4]]) -> [u64;4] {
+    let mut acc = [0u64;4]; // 0 in Mont domain is 0
+    for &xm in xs_mont {
+        let prod = mont_mul_raw(xm, fixed.a_mont);
+        acc = mont_add(acc, prod);
+    }
+    acc
 }
 
 #[cfg(test)]
@@ -241,4 +305,51 @@ mod tests {
             }
         }
     }
+    fn test_encode_decode_roundtrip() {
+        let mut rng = StdRng::seed_from_u64(2025);
+        for _ in 0..200 {
+            let x = rand_fr(&mut rng);
+            let xm = super::mont_encode(x);
+            let x_back = super::mont_decode(xm);
+            assert_eq!(x_back, x, "encode+decode should return original");
+        }
+    }
+
+    #[test]
+    fn test_mul_many_sum_matches_baseline() {
+        let mut rng = StdRng::seed_from_u64(4242);
+        let a = rand_fr(&mut rng);
+        let fm = super::FixedMontgomeryMulA::new(a);
+
+        let xs: Vec<_> = (0..500).map(|_| rand_fr(&mut rng)).collect();
+        let xs_mont = encode_batch_to_mont(&xs);
+
+        // baseline sum of a*x
+        let baseline: Fr = xs.iter().map(|&x| a * x).sum();
+
+        // montgomery path: mul in Mont domain, sum, then decode once
+        let acc_mont = mul_many_mont_sum(&fm, &xs_mont);
+        let result = mont_to_fr(acc_mont);
+
+        assert_eq!(result, baseline, "batched Mont path must equal baseline");
+    }
+
+    #[test]
+    fn test_mul_many_randomized() {
+        let mut rng = StdRng::seed_from_u64(9876);
+        for _ in 0..50 {
+            let a = rand_fr(&mut rng);
+            let fm = super::FixedMontgomeryMulA::new(a);
+            let xs: Vec<_> = (0..100).map(|_| rand_fr(&mut rng)).collect();
+            let xs_mont = encode_batch_to_mont(&xs);
+
+            let baseline: Fr = xs.iter().map(|&x| a * x).sum();
+            let acc_mont = mul_many_mont_sum(&fm, &xs_mont);
+            let result = mont_to_fr(acc_mont);
+
+            assert_eq!(result, baseline);
+        }
+    }
 }
+
+

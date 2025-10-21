@@ -1,6 +1,7 @@
 use ark_bn254::Fr;
 use ark_ff::{BigInteger, Field, PrimeField};
 pub mod mont_fixed;
+pub mod metal_gpu;
 /// Fixed-multiplicand precomputation for BN254 using a windowed lookup-add scheme.
 ///
 /// For a chosen window size W (bits), we precompute, for each window j,
