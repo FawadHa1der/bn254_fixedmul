@@ -8,6 +8,7 @@
 use ark_bn254::{Fr, FrConfig};
 use ark_ff::{BigInteger, Field, PrimeField};
 use ark_ff::MontConfig;
+
 //use super::{encode_batch_to_mont, mul_many_mont_sum, mont_to_fr};
 
 #[inline(always)]
@@ -238,6 +239,7 @@ fn mont_add(a: [u64;4], b: [u64;4]) -> [u64;4] {
     ]
 }
 
+
 /// Multiply many by fixed-A in raw Montgomery domain:
 /// - inputs: x_mont = x*R
 /// - uses mont_mul_raw(x_mont, a_mont)
@@ -251,6 +253,113 @@ pub fn mul_many_mont_sum(fixed: &FixedMontgomeryMulA, xs_mont: &[[u64;4]]) -> [u
     acc
 }
 
+// ===== SoA (Structure-of-Arrays) representation for Mont residues =====
+
+/// Structure-of-Arrays for a batch of Montgomery residues.
+/// Each element is 256-bit little-endian split into four u64 limbs.
+pub struct MontSoA {
+    pub x0: Vec<u64>,
+    pub x1: Vec<u64>,
+    pub x2: Vec<u64>,
+    pub x3: Vec<u64>,
+}
+
+/// Encode canonical Frs into Montgomery residues and store as SoA.
+pub fn encode_batch_to_mont_soa(xs: &[Fr]) -> MontSoA {
+    let mut x0 = Vec::with_capacity(xs.len());
+    let mut x1 = Vec::with_capacity(xs.len());
+    let mut x2 = Vec::with_capacity(xs.len());
+    let mut x3 = Vec::with_capacity(xs.len());
+    for &x in xs {
+        let r = mont_encode(x); // [u64;4] little-endian limbs
+        x0.push(r[0]); x1.push(r[1]); x2.push(r[2]); x3.push(r[3]);
+    }
+    MontSoA { x0, x1, x2, x3 }
+}
+
+/// Multiply many by fixed-A in Mont domain using SoA layout.
+/// Returns a Mont-domain sum (decode later with `mont_to_fr` if needed).
+pub fn mul_many_mont_sum_soa(fixed: &FixedMontgomeryMulA, xs: &MontSoA) -> [u64;4] {
+    let mut acc = [0u64;4];
+    let n = xs.x0.len();
+    for i in 0..n {
+        // (Optional) prefetch could be added under x86_64 if you want.
+        let xm = [xs.x0[i], xs.x1[i], xs.x2[i], xs.x3[i]];
+        let prod = fixed.mul_mont(xm);
+        acc = mont_add(acc, prod);
+    }
+    acc
+}
+
+// ===== Lazy 5-limb accumulation to reduce modular add cost =====
+
+#[inline(always)]
+fn add5(a: &mut [u64;5], b: [u64;4]) {
+    let (s0, c0) = a[0].overflowing_add(b[0]);
+    let (s1, c1) = a[1].overflowing_add(b[1] + c0 as u64);
+    let (s2, c2) = a[2].overflowing_add(b[2] + c1 as u64);
+    let (s3, c3) = a[3].overflowing_add(b[3] + c2 as u64);
+    let s4       = a[4] + (c3 as u64);
+    a[0]=s0; a[1]=s1; a[2]=s2; a[3]=s3; a[4]=s4;
+}
+
+#[inline(always)]
+fn normalize5(a: [u64;5]) -> [u64;4] {
+    let p = FrConfig::MODULUS.as_ref();
+
+    // Start with low 4 limbs; fold the 5th limb via at most one subtraction of p.
+    let mut s0 = a[0];
+    let mut s1 = a[1];
+    let mut s2 = a[2];
+    let mut s3 = a[3];
+
+    if a[4] != 0 {
+        let (d0, b0) = s0.overflowing_sub(p[0]);
+        let (d1, b1) = s1.overflowing_sub(p[1] + b0 as u64);
+        let (d2, b2) = s2.overflowing_sub(p[2] + b1 as u64);
+        let (d3, b3) = s3.overflowing_sub(p[3] + b2 as u64);
+        let mask = 0u64.wrapping_sub((b3 as u64) ^ 1);
+        s0 = (d0 & mask) | (s0 & !mask);
+        s1 = (d1 & mask) | (s1 & !mask);
+        s2 = (d2 & mask) | (s2 & !mask);
+        s3 = (d3 & mask) | (s3 & !mask);
+    }
+
+    // Final conditional subtract if s ≥ p.
+    let (d0, b0) = s0.overflowing_sub(p[0]);
+    let (d1, b1) = s1.overflowing_sub(p[1] + b0 as u64);
+    let (d2, b2) = s2.overflowing_sub(p[2] + b1 as u64);
+    let (d3, b3) = s3.overflowing_sub(p[3] + b2 as u64);
+    let mask = 0u64.wrapping_sub((b3 as u64) ^ 1);
+    [
+        (d0 & mask) | (s0 & !mask),
+        (d1 & mask) | (s1 & !mask),
+        (d2 & mask) | (s2 & !mask),
+        (d3 & mask) | (s3 & !mask),
+    ]
+}
+
+/// Accumulate products in a 5-limb scratch and normalize every `k` items.
+/// Returns a Mont-domain sum; decode later with `mont_to_fr`.
+pub fn mul_many_mont_sum_lazy(fixed: &FixedMontgomeryMulA, xs_mont: &[[u64;4]], k: usize) -> [u64;4] {
+    let mut acc5 = [0u64;5];
+    let mut out  = [0u64;4];
+    let mut cnt = 0usize;
+    for &xm in xs_mont {
+        let prod = fixed.mul_mont(xm);
+        add5(&mut acc5, prod);
+        cnt += 1;
+        if cnt == k {
+            out = mont_add(out, normalize5(acc5));
+            acc5 = [0;5];
+            cnt = 0;
+        }
+    }
+    if cnt != 0 {
+        out = mont_add(out, normalize5(acc5));
+    }
+    out
+}
 #[cfg(test)]
 mod tests {
     use super::*;

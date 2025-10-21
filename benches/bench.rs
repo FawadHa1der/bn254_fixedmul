@@ -1,14 +1,20 @@
 use std::time::Duration;
 
 use ark_bn254::Fr;
-use ark_ff::{Field, PrimeField};
+use ark_ff::PrimeField;
 use bn254_fixedmul::mont_fixed::{
     FixedMontgomeryMulA,
-    encode_batch_to_mont,
-    mul_many_mont_sum,
+    encode_batch_to_mont, encode_batch_to_mont_soa,
+    mul_many_mont_sum, mul_many_mont_sum_lazy, mul_many_mont_sum_soa,
     mont_to_fr,
 };
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput, black_box};
+use rand::{rngs::StdRng, Rng, SeedableRng};
+
+#[cfg(target_os = "macos")]
 use bn254_fixedmul::metal_gpu::gpu_mul_many_fixedA;
+
+// ------------------------- utils -------------------------
 
 fn random_fr<R: Rng>(rng: &mut R) -> Fr {
     let mut bytes = [0u8; 32];
@@ -16,16 +22,14 @@ fn random_fr<R: Rng>(rng: &mut R) -> Fr {
     Fr::from_le_bytes_mod_order(&bytes)
 }
 
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput, black_box};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+// ---------------------- CPU baselines --------------------
 
-
-// Baseline (arkworks a*x)
 fn bench_baseline_mul(c: &mut Criterion) {
     let mut g = c.benchmark_group("baseline_mul");
     g.sample_size(10);
     g.measurement_time(Duration::from_secs(8));
     g.warm_up_time(Duration::from_secs(3));
+
     let mut rng = StdRng::seed_from_u64(0xC0FFEE);
     let a = random_fr(&mut rng);
 
@@ -45,7 +49,7 @@ fn bench_baseline_mul(c: &mut Criterion) {
     g.finish();
 }
 
-// Fixed-A CIOS (Fr API) — includes per-call encode+decode (slow, for reference)
+// Shows encode+decode per call overhead; kept for reference.
 fn bench_fixed_mont_ciOS_naive(c: &mut Criterion) {
     let mut g = c.benchmark_group("fixed_mont_ciOS_naive");
     g.sample_size(10);
@@ -65,7 +69,7 @@ fn bench_fixed_mont_ciOS_naive(c: &mut Criterion) {
                 |_| {
                     let mut acc = Fr::from(0u64);
                     for &x in &xs {
-                        acc += fm.mul(x); // pays encode+decode each call
+                        acc += fm.mul(x); // bad: encode+decode every time
                     }
                     black_box(acc)
                 },
@@ -76,9 +80,11 @@ fn bench_fixed_mont_ciOS_naive(c: &mut Criterion) {
     g.finish();
 }
 
-// Fixed-A CIOS (raw mont) — encode once, montmul per element, decode once at end
-fn bench_fixed_mont_ciOS_raw_batched(c: &mut Criterion) {
-    let mut g = c.benchmark_group("fixed_mont_ciOS_raw_batched");
+// ---------------- Optimized CPU hot paths -----------------
+
+// AoS: encode once, MontMul per element, decode once (sum)
+fn bench_fixed_mont_raw_batched(c: &mut Criterion) {
+    let mut g = c.benchmark_group("fixed_mont_raw_batched");
     g.sample_size(10);
     g.measurement_time(Duration::from_secs(8));
     g.warm_up_time(Duration::from_secs(3));
@@ -89,16 +95,15 @@ fn bench_fixed_mont_ciOS_raw_batched(c: &mut Criterion) {
 
     for &n in &[100_000usize, 1_000_000usize] {
         let xs: Vec<Fr> = (0..n).map(|_| random_fr(&mut rng)).collect();
-        let xs_mont = encode_batch_to_mont(&xs); // ONE-TIME encode
+        let xs_mont = encode_batch_to_mont(&xs);
 
         g.throughput(Throughput::Elements(n as u64));
         g.bench_function(BenchmarkId::from_parameter(n), |b| {
             b.iter_batched(
-                || (), // nothing per-iter
+                || (),
                 |_| {
-                    // hot loop: only montmul + mont-add; then one decode
                     let acc_mont = mul_many_mont_sum(&fm, &xs_mont);
-                    black_box(mont_to_fr(acc_mont)) // single decode outside the loop
+                    black_box(mont_to_fr(acc_mont))
                 },
                 BatchSize::LargeInput,
             )
@@ -106,16 +111,70 @@ fn bench_fixed_mont_ciOS_raw_batched(c: &mut Criterion) {
     }
     g.finish();
 }
-fn random_fr<R: Rng>(rng: &mut R) -> Fr {
-    let mut bytes = [0u8; 32];
-    rng.fill(&mut bytes);
-    Fr::from_le_bytes_mod_order(&bytes)
+
+// AoS + lazy accumulation (normalize every K=8)
+fn bench_fixed_mont_raw_batched_lazy(c: &mut Criterion) {
+    let mut g = c.benchmark_group("fixed_mont_raw_batched_lazy");
+    g.sample_size(10);
+    g.measurement_time(Duration::from_secs(8));
+    g.warm_up_time(Duration::from_secs(3));
+
+    let mut rng = StdRng::seed_from_u64(0xD00D);
+    let a = random_fr(&mut rng);
+    let fm = FixedMontgomeryMulA::new(a);
+
+    for &n in &[100_000usize, 1_000_000usize] {
+        let xs: Vec<Fr> = (0..n).map(|_| random_fr(&mut rng)).collect();
+        let xs_mont = encode_batch_to_mont(&xs);
+
+        g.throughput(Throughput::Elements(n as u64));
+        g.bench_function(BenchmarkId::from_parameter(n), |b| {
+            b.iter_batched(
+                || (),
+                |_| {
+                    let acc_mont = mul_many_mont_sum_lazy(&fm, &xs_mont, 8);
+                    black_box(mont_to_fr(acc_mont))
+                },
+                BatchSize::LargeInput,
+            )
+        });
+    }
+    g.finish();
 }
 
-// ... keep your existing groups (baseline_mul, fixed_mont_ciOS_naive, etc.) ...
+// SoA layout (+prefetch) path
+fn bench_fixed_mont_soa(c: &mut Criterion) {
+    let mut g = c.benchmark_group("fixed_mont_soa");
+    g.sample_size(10);
+    g.measurement_time(Duration::from_secs(8));
+    g.warm_up_time(Duration::from_secs(3));
+
+    let mut rng = StdRng::seed_from_u64(0xFEED);
+    let a = random_fr(&mut rng);
+    let fm = FixedMontgomeryMulA::new(a);
+
+    for &n in &[100_000usize, 1_000_000usize] {
+        let xs: Vec<Fr> = (0..n).map(|_| random_fr(&mut rng)).collect();
+        let soa = encode_batch_to_mont_soa(&xs);
+
+        g.throughput(Throughput::Elements(n as u64));
+        g.bench_function(BenchmarkId::from_parameter(n), |b| {
+            b.iter(|| {
+                let acc_mont = mul_many_mont_sum_soa(&fm, &soa);
+                black_box(mont_to_fr(acc_mont))
+            })
+        });
+    }
+    g.finish();
+}
+
+// -------------------------- GPU ---------------------------
 
 #[cfg(target_os = "macos")]
 fn bench_gpu_fixedA(c: &mut Criterion) {
+    use bn254_fixedmul::metal_gpu::metal_ctx;
+    use metal::objc::rc::autoreleasepool;
+
     let mut g = c.benchmark_group("gpu_fixedA_metal");
     g.sample_size(10);
     g.measurement_time(Duration::from_secs(12));
@@ -123,18 +182,21 @@ fn bench_gpu_fixedA(c: &mut Criterion) {
 
     let mut rng = StdRng::seed_from_u64(0xBADA55);
     let a = random_fr(&mut rng);
+    let ctx = metal_ctx(); // create once
 
     for &n in &[100_000usize, 1_000_000usize, 4_000_000usize] {
         let xs: Vec<Fr> = (0..n).map(|_| random_fr(&mut rng)).collect();
 
-        // sanity: CPU baseline sum, to prevent dead-code elimination in GPU case
         g.throughput(Throughput::Elements(n as u64));
         g.bench_function(BenchmarkId::from_parameter(format!("n={}", n)), |b| {
             b.iter_batched(
-                || (),
+                || (), // setup done above
                 |_| {
-                    let ys = gpu_mul_many_fixedA(a, &xs).expect("macOS only");
-                    // Accumulate to keep the compiler honest
+                    // keep GPU work inside an autorelease pool
+                    let ys = autoreleasepool(|| {
+                        // call existing API; it will also wrap its inner CB in a pool after the patch
+                        bn254_fixedmul::metal_gpu::gpu_mul_many_fixedA(a, &xs).expect("macOS")
+                    });
                     let mut acc = Fr::from(0u64);
                     for y in ys { acc += y; }
                     black_box(acc)
@@ -147,154 +209,17 @@ fn bench_gpu_fixedA(c: &mut Criterion) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn bench_gpu_fixedA(_c: &mut Criterion) {
-    // no-op on non-macOS
-}
+fn bench_gpu_fixedA(_c: &mut Criterion) { /* no-op on non-macOS */ }
+
+// ---------------------- criterion main --------------------
 
 criterion_group!(
     benches,
-    // keep your existing benches here:
     bench_baseline_mul,
     bench_fixed_mont_ciOS_naive,
     bench_fixed_mont_raw_batched,
     bench_fixed_mont_raw_batched_lazy,
     bench_fixed_mont_soa,
-    // new:
     bench_gpu_fixedA,
 );
 criterion_main!(benches);
-
-// use std::time::Duration;
-
-// use ark_bn254::Fr;
-// use ark_ff::{Field, PrimeField};
-// use bn254_fixedmul::FixedMulPrecomp; // your crate name
-// use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput, black_box};
-// use rand::{rngs::StdRng, Rng, SeedableRng};
-
-// fn random_fr<R: Rng>(rng: &mut R) -> Fr {
-//     let mut bytes = [0u8; 32];
-//     rng.fill(&mut bytes);
-//     Fr::from_le_bytes_mod_order(&bytes)
-// }
-
-// /// Benchmark: multiply a * x for a batch of X values (baseline).
-// fn bench_baseline_mul(c: &mut Criterion) {
-//     let mut group = c.benchmark_group("baseline_mul");
-//     group.sample_size(10);
-//     group.measurement_time(Duration::from_secs(10));
-//     group.warm_up_time(Duration::from_secs(3));
-
-//     let mut rng = StdRng::seed_from_u64(0xC0FFEE);
-//     let a = random_fr(&mut rng);
-
-//     // Choose a realistic batch size to mitigate overhead. Tune as you like.
-//     for &n in &[10_000usize, 100_000usize, 1_000_000usize] {
-//         // pre-generate Xs
-//         let xs: Vec<Fr> = (0..n).map(|_| random_fr(&mut rng)).collect();
-//         group.throughput(Throughput::Elements(n as u64));
-//         group.bench_function(BenchmarkId::from_parameter(n), |b| {
-//             b.iter(|| {
-//                 // Accumulate a checksum to avoid dead-code elimination
-//                 let mut acc = Fr::from(0u64);
-//                 for &x in &xs {
-//                     acc += a * x;
-//                 }
-//                 black_box(acc)
-//             })
-//         });
-//     }
-//     group.finish();
-// }
-
-// /// Benchmark: fixed-multiplicand fast path with different window sizes.
-// fn bench_fixedmul_windows(c: &mut Criterion) {
-//     let mut group = c.benchmark_group("fixedmul_fast");
-//     group.sample_size(10);
-//     group.measurement_time(Duration::from_secs(10));
-//     group.warm_up_time(Duration::from_secs(3));
-
-//     let mut rng = StdRng::seed_from_u64(0xBEEF);
-//     let a = random_fr(&mut rng);
-//     let xs_100k: Vec<Fr> = (0..100_000).map(|_| random_fr(&mut rng)).collect();
-//     let xs_1m: Vec<Fr> = (0..1_000_000).map(|_| random_fr(&mut rng)).collect();
-
-//     // Try a few W values. Adjust to your cache.
-//     for &w in &[6usize, 8, 10, 12] {
-//         macro_rules! run_w {
-//             ($W:literal, $xs:expr, $label:expr) => {{
-//                 // Build precomputation once (what we want to amortize!)
-//                 let pre = FixedMulPrecomp::<$W>::new(a);
-//                 let n = $xs.len();
-//                 group.throughput(Throughput::Elements(n as u64));
-//                 group.bench_function(BenchmarkId::new($label, format!("W{}", $W)), |b| {
-//                     b.iter_batched(
-//                         || (), // no per-iter setup
-//                         |_| {
-//                             let mut acc = Fr::from(0u64);
-//                             for &x in &$xs {
-//                                 acc += pre.mul(x);
-//                             }
-//                             black_box(acc)
-//                         },
-//                         BatchSize::LargeInput,
-//                     )
-//                 });
-//             }};
-//         }
-
-//         run_w!(6,  xs_100k, "100k"); if w==6 {}
-//         run_w!(6,  xs_1m,   "1m");   if w==6 {}
-//         run_w!(8,  xs_100k, "100k"); if w==8 {}
-//         run_w!(8,  xs_1m,   "1m");   if w==8 {}
-//         run_w!(10, xs_100k, "100k"); if w==10 {}
-//         run_w!(10, xs_1m,   "1m");   if w==10 {}
-//         run_w!(12, xs_100k, "100k"); if w==12 {}
-//         run_w!(12, xs_1m,   "1m");   if w==12 {}
-//     }
-//     group.finish();
-// }
-
-// /// Optional: constant-time selection path (for secret X). Expect slower than fast mul().
-// fn bench_fixedmul_const_time(c: &mut Criterion) {
-//     let mut group = c.benchmark_group("fixedmul_const_time");
-//     group.sample_size(10);
-//     group.measurement_time(Duration::from_secs(10));
-//     group.warm_up_time(Duration::from_secs(3));
-
-//     let mut rng = StdRng::seed_from_u64(0xABCD);
-//     let a = random_fr(&mut rng);
-//     let xs_10k: Vec<Fr> = (0..10_000).map(|_| random_fr(&mut rng)).collect();
-
-//     macro_rules! run_w_ct {
-//         ($W:literal) => {{
-//             let pre = FixedMulPrecomp::<$W>::new(a);
-//             let n = xs_10k.len();
-//             group.throughput(Throughput::Elements(n as u64));
-//             group.bench_function(BenchmarkId::from_parameter(format!("W{}", $W)), |b| {
-//                 b.iter(|| {
-//                     let mut acc = Fr::from(0u64);
-//                     for &x in &xs_10k {
-//                         acc += pre.mul_const_time(x);
-//                     }
-//                     black_box(acc)
-//                 })
-//             });
-//         }};
-//     }
-
-//     run_w_ct!(6);
-//     run_w_ct!(8);
-//     run_w_ct!(10);
-//     run_w_ct!(12);
-
-//     group.finish();
-// }
-
-// criterion_group!(
-//     benches,
-//     bench_baseline_mul,
-//     bench_fixedmul_windows,
-//     bench_fixedmul_const_time,
-// );
-// criterion_main!(benches);
